@@ -26,6 +26,7 @@ datasets                  ==2.19.1
 debugpy                   ==1.8.1
 decorator                 ==5.1.1
 defusedxml                ==0.7.1
+dm_control
 dill                      ==0.3.8
 docopt                    ==0.6.2
 executing                 ==2.0.1

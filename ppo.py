@@ -34,7 +34,7 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="DoorEnv",
+    parser.add_argument("--env-id", type=str, default="DoorEnvPPO",
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=1500000,
         help="total timesteps of the experiments")

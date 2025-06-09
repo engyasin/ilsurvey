@@ -33,7 +33,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="DoorsDQN",
+    parser.add_argument("--env-id", type=str, default="DoorsDuelingDQN",
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=1500000,
         help="total timesteps of the experiments")
@@ -45,7 +45,7 @@ def parse_args():
         help="the discount factor gamma")
     parser.add_argument("--target-network-frequency", type=int, default=500,
         help="the timesteps it takes to update the target network")
-    parser.add_argument("--batch-size", type=int, default=128,
+    parser.add_argument("--batch-size", type=int, default=64,
         help="the batch size of sample from the reply memory")
     parser.add_argument("--start-e", type=float, default=1,
         help="the starting epsilon for exploration")
@@ -94,6 +94,8 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
 
 
 if __name__ == "__main__":
+
+    DOUBLE = False
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 
@@ -172,7 +174,13 @@ if __name__ == "__main__":
         if global_step > args.learning_starts and global_step % args.train_frequency == 0:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
-                target_max, _ = target_network(data.next_observations).max(dim=1)
+
+                if DOUBLE:
+                    best_actions = q_network(data.next_observations).argmax(dim=1)
+                    target_max = target_network(data.next_observations)[:,best_actions]
+                else:
+                    target_max, _ = target_network(data.next_observations).max(dim=1)
+
                 td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.flatten())
             old_val = q_network(data.observations).gather(1, data.actions).squeeze()
             loss = F.mse_loss(td_target, old_val)
@@ -193,4 +201,4 @@ if __name__ == "__main__":
                 target_network.load_state_dict(q_network.state_dict())
 
     writer.close()
-    torch.save(q_network,f'dqn_qnet_iter_{args.total_timesteps}_mlp.pth')
+    torch.save(q_network,f'dueling_dqn_doors_{args.total_timesteps}_mlp.pth')

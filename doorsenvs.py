@@ -8,7 +8,7 @@ from agents import Qnet,PPOAgentwithZ, Discriminator_AIRL
 
 import torch
 
-import imageio
+#import imageio
 
 import matplotlib.pyplot as plt
 import matplotlib
@@ -71,10 +71,10 @@ class Doors():
 
     def gt_reward(self):
 
-        v0 =  -np.sqrt(((self.prv_agent-self.goal)**2).sum())
-        v1 =  -np.sqrt(((self.agent-self.goal)**2).sum())
+        v0 =  np.sqrt(((self.prv_agent-self.goal)**2).sum())
+        v1 =  np.sqrt(((self.agent-self.goal)**2).sum())
 
-        return v1-v0
+        return v0-v1
 
 
 
