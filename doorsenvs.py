@@ -7,12 +7,122 @@ from agents import PPOAgent as Agent
 from agents import Qnet,PPOAgentwithZ, Discriminator_AIRL
 
 import torch
+import gymnasium as gym
 
 #import imageio
 
 import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.use('WebAgg')
+#matplotlib.use('WebAgg')
+from typing import Any, Callable, Generic, TypeVar
+
+
+class DoorsGym(gym.Env):
+
+    def __init__(self,gridSize=[15,15],nDoors=3,render_frames=True):
+        super().__init__()
+
+        self.gridSize = gridSize
+        self.nDoors = nDoors
+        self.render_frames = render_frames
+
+        self.action_space = gym.spaces.Discrete(5)
+        self.observation_space = gym.spaces.MultiDiscrete([4 for _ in range(np.prod(self.gridSize))])
+
+        #self._agent_location = np.array([self.gridSize[0]-1,(self.gridSize[1]-1)])
+        #self._goal_location = np.array([0,(self.gridSize[1]-1)])
+        self._agent_location = np.array([self.gridSize[0]-1,np.random.randint(self.gridSize[1])])
+        self._goal_location = np.array([0,np.random.randint(self.gridSize[1])])
+
+        self.actions_vocal = np.array([[0,0],[0,1],[1,0],[0,-1],[-1,0]]).astype(int)
+
+    def reset(self,seed=None,options=None):
+
+        if seed is None:
+            seed = int(sum(self._agent_location+self._goal_location))
+
+        np.random.seed(seed=seed)
+        super().reset(seed=seed)
+        
+        self._agent_location = np.array([self.gridSize[0]-1,np.random.randint(self.gridSize[1])])
+        self._goal_location = np.array([0,np.random.randint(self.gridSize[1])])
+
+
+        self._make_grid()
+
+        state = self.grid.copy().flatten()
+        info = self._get_info()
+
+        if self.render_frames:
+            self.render()
+
+        return state,info
+
+    def _make_grid(self):
+
+        self.grid = np.zeros(tuple(self.gridSize),dtype=np.int64)
+        self.grid[self.gridSize[0]//2] = 2 #wall
+        self.grid[self.gridSize[0]//2,::(self.gridSize[0]//self.nDoors)] = 0 # doors
+
+        # put agent and goal
+        self.grid[self._agent_location[0],self._agent_location[1]] = 1
+        self.grid[self._goal_location[0],self._goal_location[1]] = 3
+
+
+    def _get_info(self):
+
+        return {'distance': np.linalg.norm(self._goal_location-self._agent_location)}
+
+    def step(self, action):
+
+        movement = self.actions_vocal[action]
+        new_location = np.clip(self._agent_location+movement,0,np.array(self.gridSize)-1)
+
+        terminated = False
+        truncated = False
+        past_position = self._agent_location.copy()
+
+        # check if wall (2)
+        cell_state = self.grid[new_location[0],new_location[1]].copy()
+        if cell_state in [0,3]:
+            self.grid[self._agent_location[0],self._agent_location[1]] = 0
+            self.grid[new_location[0],new_location[1]] = 1
+
+            self._agent_location = new_location.copy()
+            terminated = (cell_state == 3) 
+
+
+        reward = self.get_reward(past_position)
+        state = self.grid.copy().flatten()
+        info = self._get_info()
+
+        if self.render_frames:
+            self.render()
+
+        return state, reward, terminated, truncated, info
+
+    
+    def get_reward(self,past_location):
+
+        old_distance = np.linalg.norm(self._goal_location-past_location)
+        new_distance = np.linalg.norm(self._goal_location-self._agent_location)
+        
+        return old_distance - new_distance
+
+
+    def render(self,scale=10):
+
+        img = np.dstack([self.grid==3,self.grid==2,self.grid==1])*1.0#.astype(np.uint16)
+        # make it big enough
+        img = img.repeat(scale,axis=0).repeat(scale,axis=1)
+        cv2.imshow('Doors',img)
+
+
+
+    def close(self):
+
+        cv2.destroyAllWindows()
+
 
 
 class Doors():
@@ -71,10 +181,10 @@ class Doors():
 
     def gt_reward(self):
 
-        v0 =  np.sqrt(((self.prv_agent-self.goal)**2).sum())
-        v1 =  np.sqrt(((self.agent-self.goal)**2).sum())
+        v0 =  -np.sqrt(((self.prv_agent-self.goal)**2).sum())
+        v1 =  -np.sqrt(((self.agent-self.goal)**2).sum())
 
-        return v0-v1
+        return v1-v0
 
 
 
@@ -134,6 +244,7 @@ class Doors():
         self.grid[-self.gridsize[0]//2] = -1
 
         self.door_blocks = []
+
         for d in range(self.doors):
             door_col = (self.gridsize[1]//self.doors)*(d+1)
             self.grid[-self.gridsize[0]//2][door_col-1] = 0
@@ -142,6 +253,7 @@ class Doors():
         self.wall_blocks = np.vstack(np.where(self.grid)).T.tolist()
 
         self.agent = np.array([self.gridsize[0]-1,np.random.randint(0,self.gridsize[1])]).astype(int) #r,c
+
         if agent_at>=0:
             self.agent[1] = agent_at
         self.grid[self.agent[0],self.agent[1]] = 2
@@ -240,6 +352,27 @@ class DoorZ(Doors):
         
         return best_action
 
+def test_gymEnv():
+
+    gym.register(id='DoorsGym-v0',
+         entry_point="doorsenvs:DoorsGym",
+         max_episode_steps=25,)
+
+    print(gym.envs.registry.keys())
+    env = gym.make('DoorsGym-v0')
+    #env = DoorsGym(gridSize=[15,15])
+
+    state, info = env.reset()
+
+    for i in range(100):
+
+        action = env.action_space.sample()
+        state, reward, terminated, truncated, info = env.step(action=action)
+        cv2.waitKey(10)
+    
+    env.close()
+
+
 def main():
     
     env = Doors(max_steps=32)
@@ -330,4 +463,4 @@ def main():
 
 if __name__=='__main__':
 
-    main()
+    test_gymEnv()

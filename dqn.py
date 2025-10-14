@@ -5,16 +5,17 @@ import random
 import time
 from distutils.util import strtobool
 import gymnasium as gym
+from gymnasium.wrappers import RecordEpisodeStatistics, Autoreset
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from stable_baselines3.common.buffers import ReplayBuffer
+from buffer import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 
-from doorsenvs import Doors
+from doorsenvs import DoorsGym
 
 from agents import DQNAgent
 
@@ -33,19 +34,23 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="DoorsDuelingDQN",
+    parser.add_argument("--env-id", type=str, default="DoorsGymDQN",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=1500000,
+    parser.add_argument("--total-timesteps", type=int, default=1000000,
         help="total timesteps of the experiments")
-    parser.add_argument("--learning-rate", type=float, default=2.5e-4,
+    parser.add_argument("--num-steps", type=int, default=38,
+        help="the number of steps to run in each environment per policy rollout")
+    parser.add_argument("--num-envs", type=int, default=16,
+        help="the number of parallel game environments")
+    parser.add_argument("--learning-rate", type=float, default=5e-4,
         help="the learning rate of the optimizer")
-    parser.add_argument("--buffer-size", type=int, default=10000,
+    parser.add_argument("--buffer-size", type=int, default=1024,
         help="the replay memory buffer size")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
-    parser.add_argument("--target-network-frequency", type=int, default=500,
+    parser.add_argument("--target-network-frequency", type=int, default=200,
         help="the timesteps it takes to update the target network")
-    parser.add_argument("--batch-size", type=int, default=64,
+    parser.add_argument("--batch-size", type=int, default=128,
         help="the batch size of sample from the reply memory")
     parser.add_argument("--start-e", type=float, default=1,
         help="the starting epsilon for exploration")
@@ -53,7 +58,7 @@ def parse_args():
         help="the ending epsilon for exploration")
     parser.add_argument("--exploration-fraction", type=float, default=0.5,
         help="the fraction of `total-timesteps` it takes from start-e to go end-e")
-    parser.add_argument("--learning-starts", type=int, default=10000,
+    parser.add_argument("--learning-starts", type=int, default=500,
         help="timestep to start learning")
     parser.add_argument("--train-frequency", type=int, default=10,
         help="the frequency of training")
@@ -62,31 +67,23 @@ def parse_args():
     return args
 
 
-def make_env(seed):
-    def thunk():
-        env = Doors()
-        env.seed(seed)
-        return env
+gym.register(id='DoorsGym-v0',entry_point="doorsenvs:DoorsGym",)
 
-    return thunk
 
-def step_all(envs,actions):
+def make_env(seed=None, num_steps = 300):
+    base_env = gym.make('DoorsGym-v0',
+                max_episode_steps=num_steps,
+                gridSize=[30,30],
+                render_frames=False)
 
-    states,rewards,dones,infos = [],[],[],[]
+    env = Autoreset(base_env)
+    env = RecordEpisodeStatistics(env)
+    _ = env.reset(seed=seed)
 
-    for i,env in enumerate(envs):
-        state,reward,done,info = env.step(actions[i])
-        states.append(state)
-        rewards.append(reward)
-        dones.append(done)
-        infos.append(info)
-    
-    return states,rewards,dones,infos
+    return env
 
 
 # ALGO LOGIC: initialize agent here:
-
-
 
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     slope = (end_e - start_e) / duration
@@ -95,12 +92,11 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
 
 if __name__ == "__main__":
 
-    DOUBLE = False
     args = parse_args()
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 
-    NUM_ENVS = 4
-    NUM_STEPS = 32
+    NUM_ENVS = args.num_envs
+
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
@@ -114,21 +110,20 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-
+    print(device)
     # env setup
     #envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name)])
     #assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
-    envs = [Doors(max_steps=NUM_STEPS,seed=args.seed + i) for i in range(NUM_ENVS)]
-
-    q_network = DQNAgent(envs).to(device)
+    vecEnvs = gym.vector.SyncVectorEnv([lambda : make_env(num_steps=args.num_steps) for i in range(NUM_ENVS)])
+    q_network = DQNAgent(vecEnvs).to(device)
     optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate)
-    target_network = DQNAgent(envs).to(device)
+    target_network = DQNAgent(vecEnvs).to(device)
     target_network.load_state_dict(q_network.state_dict())
 
     rb = ReplayBuffer(
         args.buffer_size,
-        gym.spaces.Box(-1,2,shape=envs[0].single_observation_space),
-        gym.spaces.Discrete(envs[0].single_action_space[0]),
+        vecEnvs.observation_space,
+        vecEnvs.action_space,
         device,
         n_envs=NUM_ENVS,
         handle_timeout_termination=True,
@@ -136,36 +131,43 @@ if __name__ == "__main__":
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
-    obs = [env.reset() for env in envs]
-    for global_step in range(args.total_timesteps):
+    obs,infos = vecEnvs.reset()
+    dones = np.array([False]* NUM_ENVS)
+
+    for global_step in range(args.total_timesteps//(NUM_ENVS)):
         # ALGO LOGIC: put action logic here
         epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
 
         if random.random() < epsilon:
-            actions = np.array([np.random.randint(envs[0].single_action_space[0]) for _ in range(NUM_ENVS)])
+            actions = vecEnvs.action_space.sample()
         else:
             q_values = q_network(torch.Tensor(obs).to(device))
             actions = torch.argmax(q_values, dim=1).cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
-        #next_obs, rewards, dones, infos = envs.step(actions)
-        next_obs, rewards, dones, infos = step_all(envs,actions)
+        next_obs, rewards, terminated, truncated, infos = vecEnvs.step(actions)
+
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        for info in infos:
-            if "episode" in info.keys():
-                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                writer.add_scalar("charts/epsilon", epsilon, global_step)
-                break
+        if "episode" in infos.keys():
+            print(f"global_step={global_step}, episodic_return={infos['episode']['r'].mean()}")
+            writer.add_scalar("charts/episodic_return", infos["episode"]["r"].mean(), global_step)
+            writer.add_scalar("charts/episodic_length", infos["episode"]["l"].mean(), global_step)
+            writer.add_scalar("charts/epsilon", epsilon, global_step)
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
         real_next_obs = next_obs.copy()
-        for idx, d in enumerate(dones):
-            if d:
-                real_next_obs[idx] = infos[idx]["terminal_observation"]
-        rb.add(obs, real_next_obs, actions, rewards, dones, infos)
+        # old dones
+        not_done = np.logical_not(dones).copy()
+        dones = np.logical_or(terminated,truncated)
+
+        if not_done.any():
+
+            rb.add(obs[not_done], 
+                   real_next_obs[not_done], 
+                   actions[not_done], 
+                   rewards[not_done], 
+                   terminated[not_done])
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
@@ -175,14 +177,10 @@ if __name__ == "__main__":
             data = rb.sample(args.batch_size)
             with torch.no_grad():
 
-                if DOUBLE:
-                    best_actions = q_network(data.next_observations).argmax(dim=1)
-                    target_max = target_network(data.next_observations)[:,best_actions]
-                else:
-                    target_max, _ = target_network(data.next_observations).max(dim=1)
-
+                target_max, _ = target_network(data.next_observations).max(dim=1)
+                # Termination only (Truncation takes target_max)
                 td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.flatten())
-            old_val = q_network(data.observations).gather(1, data.actions).squeeze()
+            old_val = q_network(data.observations).gather(1, data.actions.int()).squeeze()
             loss = F.mse_loss(td_target, old_val)
 
             if global_step % 100 == 0:
@@ -201,4 +199,5 @@ if __name__ == "__main__":
                 target_network.load_state_dict(q_network.state_dict())
 
     writer.close()
-    torch.save(q_network,f'dueling_dqn_doors_{args.total_timesteps}_mlp.pth')
+    torch.save(q_network,f'dqn_doorsgym_{args.total_timesteps}_mlp.pth')
+    #torch.save(q_network,f'dqn_qnet_iter_{args.total_timesteps}_mlp.pth')

@@ -97,20 +97,19 @@ class PPOAgentwithZ(nn.Module):
 
 # ALGO LOGIC: initialize agent here:
 class DQNAgent(nn.Module):
-    def __init__(self, env):
+    def __init__(self, envs):
         super().__init__()
         self.network = nn.Sequential(
-            layer_init(nn.Linear(np.array(env[0].single_observation_space).prod(), 120)),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
             nn.ReLU(),
-            layer_init(nn.Linear(120, 84)),
+            layer_init(nn.Linear(64, 32)),
             nn.ReLU(),
-            layer_init(nn.Linear(84, env[0].single_action_space[0])),
+            layer_init(nn.Linear(32, envs.single_action_space.n)),
         )
 
     def forward(self, x):
         return self.network(x)
     
-
 
 
 # PHI network for maxnet
