@@ -187,7 +187,7 @@ def objective_jax(trial,argsParams,device):
     dones = np.array([False]* argsParams["num_envs"])
     rolling_rewards = [0]
 
-    @jax.jit
+    @jit
     def update(q_state, observations, actions, next_observations, rewards, dones):
 
         q_next_target = q_network.apply(q_state.target_params, next_observations)  # (batch_size, num_actions)

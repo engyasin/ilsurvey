@@ -9,6 +9,7 @@ import flax
 import flax.linen as nn
 import gymnasium as gym
 import jax
+from jax import jit
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -176,7 +177,7 @@ if __name__ == "__main__":
         handle_timeout_termination=False,
     )
 
-    @jax.jit
+    @jit
     def update(q_state, observations, actions, next_observations, rewards, dones):
         q_next_target = q_network.apply(q_state.target_params, next_observations)  # (batch_size, num_actions)
         q_next_target = jnp.max(q_next_target, axis=-1)  # (batch_size,)
