@@ -10,8 +10,13 @@ Code accompanying the blog-posts:
 **A Comprehensive Overview with Theory, Implementation, and Benchmarking**
 
 
+# [Reinforcement Learning with Bells and Whistles](https://www.rlbyexample.net/posts/posts/reinforcement-learning-with-bells-and-whistles/)
+
+**Robust training of RL agents with Gymnasium, Optuna, MLflow, Jax and Flax**
+
 ## Install
 
 ```
 pip install -r requirement.txt
 ```
+
