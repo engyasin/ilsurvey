@@ -2,3 +2,5 @@ __pycache__
 post.md
 images
 runs
+mlruns
+flaxmodels

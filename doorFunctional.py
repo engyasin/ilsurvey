@@ -41,6 +41,9 @@ class DoorsEnvJax(gym.Env):
         self.action_space = gym.spaces.Discrete(5)
         self.observation_space = gym.spaces.MultiDiscrete([4 for _ in range(self.gridSize[0]*self.gridSize[1])])
 
+        self.single_action_space = self.action_space
+        self.single_observation_space = self.observation_space
+
         self.actions_vocal = np.array([[0,0],[0,1],[1,0],[0,-1],[-1,0]]).astype(int)
 
 
@@ -56,7 +59,7 @@ class DoorsEnvJax(gym.Env):
         info = self._get_info(agent_location,goal_location)
         #if self.render_frames:
         #    self.render(state)
-        info.update({"new_state":np.zeros_like(state[None,...]),
+        info.update({"new_state":np.zeros_like(state[...]),
                      "episode":{'r':0,'l':0},
                      "num_steps":35})
 
@@ -124,9 +127,10 @@ class DoorsEnvJax(gym.Env):
         #    state = state.at[agent_location].set(0)
         #    state = state.at[new_location].set(1)
 
-        agent_location = new_location.copy()
+        agent_location = np.hstack(np.where(state==1,size=1))
 
         terminated = (cell_state == 3) 
+
 
         #terminated = (cell_state == 3) 
         reward = self._get_reward(past_position,agent_location,goal_location)
@@ -153,13 +157,14 @@ class DoorsEnvJax(gym.Env):
 
         old_distance = np.linalg.norm(goal_location-past_location)
         new_distance = np.linalg.norm(goal_location-agent_location)
-        return old_distance - new_distance
+        return (old_distance - new_distance)
 
     @partial(jit,static_argnums=(0,))
     @partial(vmap,in_axes=(None,0))
     def render(self,state, scale=10):
         grid = state
         img = np.dstack([grid==3,grid==2,grid==1])*1.0#.astype(np.uint16)
+        img = img.reshape(*tuple(self.gridSize),-1)
         # make it big enough
         img = img.repeat(scale,axis=0).repeat(scale,axis=1)
         # NOTE: Error here
@@ -192,44 +197,58 @@ def make_env():
 
     return base_env
 
-def run_env(env):
+def run_env():
 
     key = random.PRNGKey(0)
     NUM_DEVICES = 1 # pmap
+
     NUM_ENVS = 4 # vmap
-    keys = random.split(key,NUM_ENVS)#.reshape(NUM_DEVICES, NUM_ENVS//NUM_DEVICES,-1)
+    num_steps = 512
+    results = []
 
-    #EnvConfigs = [init_env(nDoors=3,gridSize=[30,30],render_frames=False) for _ in range(NUM_ENVS)]
+    for NUM_ENVS in range(1,501,20):
+        keys = random.split(key,NUM_ENVS)#.reshape(NUM_DEVICES, NUM_ENVS//NUM_DEVICES,-1)
 
-    #envs = [make_env() for _ in range(NUM_ENVS)]
-    env_state, info = env.reset(keys)
-    state = env_state[0]
-    print(state.device)
-    start_time = time.time()
-    for i in range(250):
+        #EnvConfigs = [init_env(nDoors=3,gridSize=[30,30],render_frames=False) for _ in range(NUM_ENVS)]
+        env = DoorsEnvJax(nDoors=3,
+                    gridSize=[15,15],
+                    )
+        #envs = [make_env() for _ in range(NUM_ENVS)]
+        env_state, info = env.reset(keys)
+        state = env_state[0]
 
-        action = np.array([env.action_space.sample() for _ in range(NUM_ENVS)])
-        env_state, reward, terminated, truncated, info = env.step(action, env_state,
-                                                              info)
-        #print(action)
-        #print(info['agent_location'])
-        #print(info['agent_location']-info['goal_location'])
-        #imgs = env.render(env_state[0])
-        #cv2.imshow('out',numpy.asarray(imgs[NUM_ENVS-1,...]))
-        cv2.waitKey(10)
-        if np.array([truncated]).any():
-            print(f'truncated at step {i}')
-            #print(info)
-            break
+        start = time.time()
+        env_state, info = env.reset(keys)
+        for i in range(num_steps):
 
-    print("Time taken to step in the environment:", time.time() - start_time)
-    env.close()
+            new_key = random.split(env_state[1][0,:])[0]
+            action = random.randint(new_key,(NUM_ENVS,),minval=0,maxval=5)
+
+            env_state, reward, terminated, truncated, info = jax.block_until_ready(env.step(action, env_state,
+                                                                info))
+            #print(action)
+            #print(info['agent_location'])
+            #print(info['agent_location']-info['goal_location'])
+            #imgs = env.render(env_state[0])
+            #cv2.imshow('out',numpy.asarray(imgs[NUM_ENVS-1,...]))
+            #if np.array([truncated]).any():
+            #    print(f'truncated at step {i}')
+                #print(info)
+            #    break
+        duration = time.time()-start
+        print(f'N_Envs: {NUM_ENVS}. Time needed: {duration} seconds.')
+        results.append(f'{NUM_ENVS}:{duration}')
+        env.close()
+
+    with open('runtime_doors_jax_forloop.txt','w') as f:
+        f.write('\n'.join(results))
+
 
 @partial(jit,static_argnums=(1,))
 def run_jax_env(key,NUM_ENVS):
 
     env = DoorsEnvJax(nDoors=3,
-                gridSize=[30,30],
+                gridSize=[15,15],
                 )
     #env = Autoreset(base_env)
     #env = RecordEpisodeStatistics(env)
@@ -253,9 +272,8 @@ def run_jax_env(key,NUM_ENVS):
     init_val = (env_state, np.zeros((NUM_ENVS,)) , np.zeros((NUM_ENVS,),dtype=np.bool_),
                  np.zeros((NUM_ENVS,),dtype=np.bool_),  info)
 
-    env_state, reward, terminated, truncated, info = lax.fori_loop(0,2500, for_loop_body, init_val)
-
-
+    env_state, reward, terminated, truncated, info = lax.fori_loop(0,512, for_loop_body, init_val)
+    env.close()
 
 def main():
 
@@ -270,16 +288,25 @@ def main():
     #num_envs = 4
     #vecEnvs = gym.vector.SyncVectorEnv([make_env for _ in range(num_envs)])
 
-    start_time = time.time()
+
 
     #run_env(env)
     key = random.PRNGKey(0)
     NUM_DEVICES = 1 # pmap
     NUM_ENVS = 2400 # vmap
-    keys = random.split(key,NUM_ENVS)#.reshape(NUM_DEVICES, NUM_ENVS//NUM_DEVICES,-1)
+    results = []
+    for NUM_ENVS in range(1,501,20):
+        keys = random.split(key,NUM_ENVS)#.reshape(NUM_DEVICES, NUM_ENVS//NUM_DEVICES,-1)
+        start_time = time.time()
+        jax.block_until_ready(run_jax_env(keys,NUM_ENVS))
 
-    jax.block_until_ready(run_jax_env(keys,NUM_ENVS))
-    print("Time taken to run the environment:", time.time() - start_time)
+        duration =  time.time() - start_time
+        print(f'N_Envs: {NUM_ENVS}. Time needed: {duration} seconds.')
+        results.append(f'{NUM_ENVS}:{duration}')
+
+    with open('runtime_doors_jax_full.txt','w') as f:
+        f.write('\n'.join(results))
+
     #SyncVectorEnv : 0.00698 s
     #AsyncVectorEnv : 0.01801 s
 

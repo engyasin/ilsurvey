@@ -15,12 +15,13 @@ import torch.optim as optim
 from buffer import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 
-
+import jax
 import mlflow
 import optuna
 from optuna.samplers import TPESampler
 from optuna.pruners import HyperbandPruner
 
+from doorFunctional import DoorsEnvJax
 from functools import partial
 
 from doorsenvs import DoorsGym
@@ -48,7 +49,7 @@ def parse_args():
         help="total timesteps of the experiments")
     parser.add_argument("--num-steps", type=int, default=38,
         help="the number of steps to run in each environment per policy rollout")
-    parser.add_argument("--num-envs", type=int, default=16*4,
+    parser.add_argument("--num-envs", type=int, default=256*4,
         help="the number of parallel game environments")
     parser.add_argument("--learning-rate", type=float, default=5e-4,
         help="the learning rate of the optimizer")
@@ -113,8 +114,22 @@ def objective(trial,argsParams,device):
 
     # init networks, optimizer, env and buffer
 
-    vecEnvs = gym.vector.SyncVectorEnv([lambda : make_env(num_steps=argsParams['num_steps']) for i in range(argsParams['num_envs'])])
-    q_network = DQNAgent(vecEnvs).to(device)
+    #run_env(env)
+    key = jax.random.PRNGKey(argsParams['seed'])
+    key, q_key = jax.random.split(key, 2)
+    keys = jax.random.split(key,argsParams['num_envs'])#.reshape(NUM_DEVICES, NUM_ENVS//NUM_DEVICES,-1)
+    env = DoorsEnvJax(nDoors=3,
+                gridSize=[15,15],
+                )
+    
+    env_state, infos = env.reset(keys)# to emulate patch
+    obs,keys = env_state
+    obs = obs.reshape(-1,np.array(env.observation_space.shape).prod())
+    obs = jax.device_get(obs)
+    infos["num_steps"] = infos["num_steps"].at[:].set(argsParams["num_steps"])
+
+
+    q_network = DQNAgent(env).to(device)
     
     # Configure optimizer
     if argsParams["optimizer_name"] == "Adam":
@@ -122,13 +137,13 @@ def objective(trial,argsParams,device):
     else:
         optimizer = optim.SGD(q_network.parameters(),  lr=argsParams["learning_rate"])
 
-    target_network = DQNAgent(vecEnvs).to(device)
+    target_network = DQNAgent(env).to(device)
     target_network.load_state_dict(q_network.state_dict())
 
     rb = ReplayBuffer(
         argsParams["buffer_size"],
-        vecEnvs.single_observation_space,
-        vecEnvs.single_action_space,
+        env.observation_space,
+        env.action_space,
         device,
         n_envs=argsParams["num_envs"],
         handle_timeout_termination=True,
@@ -136,7 +151,7 @@ def objective(trial,argsParams,device):
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
-    obs,infos = vecEnvs.reset()
+
     dones = np.array([False]* argsParams["num_envs"])
     rolling_rewards = [0]
 
@@ -151,27 +166,37 @@ def objective(trial,argsParams,device):
             epsilon = linear_schedule(argsParams["start_e"], argsParams["end_e"], argsParams["exploration_fraction"] * (argsParams["total_timesteps"]//argsParams['num_envs']), global_step)
 
             if random.random() < epsilon:
-                actions = vecEnvs.action_space.sample()
+                key = jax.random.split(key)[0]
+                actions = jax.random.randint(key,(argsParams['num_envs'],),minval=0,maxval=5)
+                actions = jax.device_get(actions)
             else:
                 q_values = q_network(torch.Tensor(obs).to(device))
                 actions = torch.argmax(q_values, dim=1).cpu().numpy()
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, rewards, terminated, truncated, infos = vecEnvs.step(actions)
-
+            env_state, rewards, terminated, truncated, infos = env.step(actions, env_state ,infos)
+            next_obs,new_key = env_state
+            next_obs = next_obs.reshape(-1,np.array(env.observation_space.shape).prod())
+            next_obs = jax.device_get(next_obs)
             # TRY NOT TO MODIFY: record rewards for plotting purposes
-            if "episode" in infos.keys():
-                print(f"global_step={global_step}, episodic_return={infos['episode']['r'].mean()}")
+            finished = np.logical_or(terminated,truncated)
 
-                mlflow.log_metrics({"charts/episodic_return": infos["episode"]["r"].mean(),
-                                    "charts/episodic_length": infos["episode"]["l"].mean(),
+            if finished.any():
+
+                print(f"global_step={global_step}, episodic_return={infos['episode']['r'][finished].mean()}")
+
+                mlflow.log_metrics({"charts/episodic_return": infos["episode"]["r"][finished].mean(),
+                                    "charts/episodic_length": infos["episode"]["l"][finished].mean(),
                                     "charts/epsilon": f"{epsilon:2f}"},
                                     step=global_step)
-                rolling_rewards.append(infos["episode"]["r"].mean()/infos["episode"]["l"].mean())
 
+                rolling_rewards.append(infos["episode"]["r"][finished].mean()/infos["episode"]["l"][finished].mean())
+
+                infos["episode"]["r"] = infos["episode"]["r"].at[finished].set(0)
+                infos["episode"]["l"] = infos["episode"]["l"].at[finished].set(0)
             # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
-            real_next_obs = next_obs.copy()
 
+            real_next_obs = next_obs.copy()
 
             #cv2.imshow('a',((next_obs[0,...]*80)).astype(np.uint8).reshape(15,15))
             #cv2.waitKey(5)
@@ -202,18 +227,19 @@ def objective(trial,argsParams,device):
                     old_val = q_network(data.observations).gather(1, data.actions.int()).squeeze()
                     loss = F.mse_loss(td_target, old_val)
 
-                    if global_step % 100 == 0:
-
-                        mlflow.log_metric("losses/td_loss", loss, step=global_step)
-                        mlflow.log_metric("losses/q_values", old_val.mean().item(), step=global_step)
-                        mlflow.log_metric("losses/SPS", int(global_step / (time.time() - start_time)), step=global_step)
-
-                        print("SPS:", int(global_step / (time.time() - start_time)))
 
                     # optimize the model
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
+
+                if global_step % 100 == 0:
+
+                    mlflow.log_metric("losses/td_loss", loss, step=global_step)
+                    mlflow.log_metric("losses/q_values", old_val.mean().item(), step=global_step)
+                    mlflow.log_metric("losses/SPS", int(global_step / (time.time() - start_time)), step=global_step)
+
+                    print("SPS:", int(global_step / (time.time() - start_time)))
 
                 # update the target network
                 if global_step % argsParams["target_network_frequency"] == 0:

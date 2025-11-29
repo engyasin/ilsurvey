@@ -23,7 +23,7 @@ import cv2
 from functools import partial
 
 #from doorsenvs import DoorsGym
-#from doorFunctional import DoorsEnvJax
+from doorFunctional import DoorsEnvJax
 
 import jax
 from jax import jit
@@ -55,19 +55,19 @@ def parse_args():
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=500000,
         help="total timesteps of the experiments")
-    parser.add_argument("--num-steps", type=int, default=15,
+    parser.add_argument("--num-steps", type=int, default=38,
         help="the number of steps to run in each environment per policy rollout")
-    parser.add_argument("--num-envs", type=int, default=16*4,
+    parser.add_argument("--num-envs", type=int, default=256*4,
         help="the number of parallel game environments")
-    parser.add_argument("--learning-rate", type=float, default=0.000727,
+    parser.add_argument("--learning-rate", type=float, default=5e-4,
         help="the learning rate of the optimizer")
-    parser.add_argument("--buffer-size", type=int, default=720,
+    parser.add_argument("--buffer-size", type=int, default=1024,
         help="the replay memory buffer size")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--target-network-frequency", type=int, default=200,
         help="the timesteps it takes to update the target network")
-    parser.add_argument("--batch-size", type=int, default=48,
+    parser.add_argument("--batch-size", type=int, default=128,
         help="the batch size of sample from the reply memory")
     parser.add_argument("--start-e", type=float, default=1,
         help="the starting epsilon for exploration")
@@ -77,7 +77,7 @@ def parse_args():
         help="the fraction of `total-timesteps` it takes from start-e to go end-e")
     parser.add_argument("--learning-starts", type=int, default=100,
         help="timestep to start learning")
-    parser.add_argument("--train-frequency", type=int, default=9,
+    parser.add_argument("--train-frequency", type=int, default=10,
         help="the frequency of training")
     parser.add_argument("--train-iteration", type=int, default=8,
         help="the iteration of training")
@@ -86,22 +86,6 @@ def parse_args():
     args = parser.parse_args()
     # fmt: on
     return args
-
-
-gym.register(id='DoorsGym-v0',entry_point="doorsenvs:DoorsGym",)
-
-
-def make_env(seed=None, num_steps = 300):
-    base_env = gym.make('DoorsGym-v0',
-                max_episode_steps=num_steps,
-                gridSize=[15,15],
-                render_frames=False)
-
-    env = Autoreset(base_env)
-    env = RecordEpisodeStatistics(env)
-    _ = env.reset(seed=seed)
-
-    return env
 
 
 
@@ -132,20 +116,34 @@ class TrainState(TrainState):
 
 
 
-def objective_jax(argsParams,device,run_name='template'):
+def objective_jax(trial,argsParams,device):
 
     # define hyper parameters
 
-    #run_env(env)
-    vecEnvs = gym.vector.SyncVectorEnv([lambda : make_env(num_steps=argsParams['num_steps']) for i in range(argsParams['num_envs'])])
+    argsParams.update({"num_steps":trial.suggest_int("num_steps", 13, 17, step=1)})
+    argsParams.update({"learning_rate":trial.suggest_float("learning_rate", 1e-4, 1e-1, log=True)})
+    argsParams.update({"buffer_size":trial.suggest_int("buffer_size",72 , 1024, step=32, log=False)})
+    argsParams.update({"batch_size":trial.suggest_int("batch_size", 16, 128, step=16)})
+    argsParams.update({"train_frequency":trial.suggest_int("train_frequency", 4, 24, step=1, log=True)})
+    argsParams.update({"train_iteration":trial.suggest_int("train_iteration", 4, 16, step=1, log=False)})
+    #argsParams.update({"optimizer_name": trial.suggest_categorical("optimizer_name", ["Adam", "SGD"])})
 
+    # init networks, optimizer, env and buffer
+
+    #run_env(env)
     key = jax.random.PRNGKey(argsParams['seed'])
     key, q_key = jax.random.split(key, 2)
     keys = jax.random.split(key,argsParams['num_envs'])#.reshape(NUM_DEVICES, NUM_ENVS//NUM_DEVICES,-1)
-
+    env = DoorsEnvJax(nDoors=3,
+                gridSize=[15,15],
+                )
     
-    obs,infos = vecEnvs.reset()
-    q_network = DQNAgentFlax(action_dim=vecEnvs.single_action_space.n)
+    env_state, infos = env.reset(keys)# to emulate patch
+    obs,keys = env_state
+    obs = obs.reshape(-1,np.array(env.observation_space.shape).prod())
+    infos["num_steps"] = infos["num_steps"].at[:].set(argsParams["num_steps"])
+
+    q_network = DQNAgentFlax(action_dim=env.action_space.n)
 
     q_state = TrainState.create(
         apply_fn=q_network.apply,
@@ -159,16 +157,19 @@ def objective_jax(argsParams,device,run_name='template'):
     q_state = q_state.replace(target_params=optax.incremental_update(q_state.params, q_state.target_params, 1))
 
 
+
     rb = ReplayBuffer(
         argsParams["buffer_size"],
-        vecEnvs.single_observation_space,
-        vecEnvs.single_action_space,
+        env.observation_space,
+        env.action_space,
         device,
         n_envs=argsParams["num_envs"],
         handle_timeout_termination=True,
     )
     start_time = time.time()
+
     # TRY NOT TO MODIFY: start the game
+
 
     dones = np.array([False]* argsParams["num_envs"])
     rolling_rewards = [0]
@@ -189,7 +190,9 @@ def objective_jax(argsParams,device,run_name='template'):
         q_state = q_state.apply_gradients(grads=grads)
         return loss_value, q_pred, q_state
 
-    with mlflow.start_run() as run:
+
+
+    with mlflow.start_run(nested=True) as run:
 
         mlflow.log_params(argsParams)
 
@@ -207,29 +210,37 @@ def objective_jax(argsParams,device,run_name='template'):
                 #actions = jax.numpy.array(torch.argmax(q_values, dim=1).cpu().numpy())
                 q_values = q_network.apply(q_state.params, obs)
                 actions = q_values.argmax(axis=-1)
-            #actions = jax.device_get(actions)
+                actions = jax.device_get(actions)
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, rewards, terminated, truncated, infos = vecEnvs.step(actions)
+            env_state, rewards, terminated, truncated, infos = env.step(actions, env_state ,infos)
+            next_obs,new_key = env_state
+            next_obs = next_obs.reshape(-1,np.array(env.observation_space.shape).prod())
 
-            not_done = np.logical_not(dones).copy()
-            dones = np.logical_or(terminated,truncated)
             # TRY NOT TO MODIFY: record rewards for plotting purposes
+            finished = np.logical_or(terminated,truncated)
 
-            if "episode" in infos.keys():
-                print(f"global_step={global_step}, episodic_return={infos['episode']['r'][dones].mean()}")
+            if finished.any():
 
-                mlflow.log_metrics({"charts/episodic_return": infos["episode"]["r"][dones].mean(),
-                                    "charts/episodic_length": infos["episode"]["l"][dones].mean(),
+                print(f"global_step={global_step}, episodic_return={infos['episode']['r'][finished].mean()}")
+
+                mlflow.log_metrics({"charts/episodic_return": infos["episode"]["r"][finished].mean(),
+                                    "charts/episodic_length": infos["episode"]["l"][finished].mean(),
                                     "charts/epsilon": f"{epsilon:2f}"},
                                     step=global_step)
 
-                rolling_rewards.append(infos["episode"]["r"][dones].mean()/infos["episode"]["l"][dones].mean())
+                rolling_rewards.append(infos["episode"]["r"][finished].mean()/infos["episode"]["l"][finished].mean())
+
+                infos["episode"]["r"] = infos["episode"]["r"].at[finished].set(0)
+                infos["episode"]["l"] = infos["episode"]["l"].at[finished].set(0)
+
 
             # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
             real_next_obs = next_obs.copy()
             #cv2.imshow('a',jax.device_get((env_state[0][0,...]*80)).astype(np.uint8))
             #cv2.waitKey(5)
+            not_done = np.logical_not(dones).copy()
+            dones = np.logical_or(terminated,truncated)
 
             if not_done.any():
 
@@ -245,7 +256,7 @@ def objective_jax(argsParams,device,run_name='template'):
             # ALGO LOGIC: training.
             if global_step > argsParams["learning_starts"] and global_step % argsParams["train_frequency"] == 0:
 
-                for i in range(8):
+                for i in range(argsParams["train_iteration"]):
                     data = rb.sample(argsParams["batch_size"])
 
                     # perform a gradient-descent step
@@ -283,8 +294,11 @@ def objective_jax(argsParams,device,run_name='template'):
                     )
 
             # for hyperband
+            trial.report(np.mean(rolling_rewards[-2000:]), step=global_step)
             mlflow.log_metric("rolling_reward", np.mean(rolling_rewards[-2000:]), step=global_step)
 
+            if trial.should_prune():
+                raise optuna.TrialPruned()
 
         with open(f'flaxmodels/dqn_doorsgym_{argsParams["total_timesteps"]}_{mlflow.active_run().info.run_name}_mlp','wb') as f:
             f.write(flax.serialization.to_bytes(q_state.params))
@@ -297,13 +311,12 @@ def objective_jax(argsParams,device,run_name='template'):
 def main():
 
     args = parse_args()
-    experiment_name = f"{args.env_id}__{args.exp_name}_gym"
+    experiment_name = f"{args.env_id}__{args.exp_name}"
     run_name = f"{args.env_id}_{args.seed}__{int(time.time())}"
 
     mlflow.set_tracking_uri("http://localhost:5000")
     #mlflow.create_experiment(f"runs/{experiment_name}_tests")
     mlflow.set_experiment(f"runs/{experiment_name}")
-
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -315,13 +328,33 @@ def main():
 
     max_epochs = args.total_timesteps//args.num_envs
     # Execute hyperparameter search
+    with mlflow.start_run(run_name=run_name) as run:
 
-    objective_jax(argsParams=vars(args).copy(),device=device,run_name=run_name)
+        study = optuna.create_study(sampler=TPESampler(seed=args.seed, multivariate=False),
+                                    pruner=HyperbandPruner(min_resource=240, max_resource=max_epochs, reduction_factor=3), #resource represents epochs
+                                    direction="maximize")
 
+        objective_func = partial(
+            objective_jax, argsParams=vars(args).copy(), device=device
+        )
 
+        study.optimize(objective_func, n_trials=40)
 
+        # Log best parameters and score
+        mlflow.log_params(study.best_params)
+        mlflow.log_metric("best_reward", study.best_value)
+
+    optuna.visualization.plot_param_importances(study).show()
+    # evaluator is optuna.importance.FanovaImportanceEvaluator by default or optuna.importance.MeanDecreaseImpurityImportanceEvaluator
+    optuna.visualization.plot_contour(study).show()
 
     # load best model
+    ranked_models = mlflow.search_logged_models(#experiment_ids=[f"runs/{experiment_name}"],
+                                                filter_string=f"source_run_id='{run.info.run_id}'",
+                                                order_by=[{"field_name": "metrics.rolling_reward", "ascending": False}],
+                                                output_format="list",
+                                                )
+
 
     # Get the best performing model
     #best_model = ranked_models[0]

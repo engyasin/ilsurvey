@@ -8,12 +8,24 @@ from agents import Qnet,PPOAgentwithZ, Discriminator_AIRL
 
 import torch
 import gymnasium as gym
+from gymnasium.wrappers import RecordEpisodeStatistics, Autoreset
+import mlflow
 
 #import imageio
+import time
+
+import flax
+import jax
+from jax import jit
+import jax.numpy as jnp
+import flax.linen as nn
+from dqn_hopt_flax import DQNAgentFlax
 
 import matplotlib.pyplot as plt
 import matplotlib
+import time
 #matplotlib.use('WebAgg')
+from doorFunctional import DoorsEnvJax
 from typing import Any, Callable, Generic, TypeVar
 
 
@@ -117,12 +129,9 @@ class DoorsGym(gym.Env):
         img = img.repeat(scale,axis=0).repeat(scale,axis=1)
         cv2.imshow('Doors',img)
 
-
-
     def close(self):
 
         cv2.destroyAllWindows()
-
 
 
 class Doors():
@@ -357,20 +366,234 @@ def test_gymEnv():
     gym.register(id='DoorsGym-v0',
          entry_point="doorsenvs:DoorsGym",
          max_episode_steps=25,)
-
-    print(gym.envs.registry.keys())
+    
+    #print(gym.envs.registry.keys())
     env = gym.make('DoorsGym-v0')
     #env = DoorsGym(gridSize=[15,15])
 
-    state, info = env.reset()
 
+    TORCHMODEL = True
+
+    if TORCHMODEL:
+        mlflow.set_tracking_uri("http://localhost:5000")
+        mlflow.set_experiment(f"runs/DoorsGymDQN__dqn_hopt")
+        named_run = mlflow.search_runs(filter_string=f"run_name='gentle-loon-975'",output_format='list')[0]
+
+        ranked_models = mlflow.search_logged_models(#experiment_ids=[f"runs/DoorsGymDQN__dqn_hopt"], # use active experiment if not specified
+                                                    #filter_string=f"source_run_id='{named_run.info.run_id}'",
+                                                    order_by=[{"field_name": "metrics.rolling_reward", "ascending": False}],
+                                                    output_format="list",
+                                                    )
+        # Get the best performing model
+        best_model = ranked_models[0]
+        print(named_run.info.run_name)
+        model_uri = f"models:/{best_model.model_id}" # or from dashboard
+        model = mlflow.pytorch.load_model(model_uri).eval()
+    else:
+
+        mlflow.set_experiment(f"runs/DoorsGymDQN__dqn_hopt_flax")
+        named_run = mlflow.search_runs(#filter_string=f"run_name='rumbling-donkey-443'",
+                                                    order_by=["metrics.rolling_reward DESC"],
+                                                    #order_by=[{"field_name": "metrics.rolling_reward", "ascending": False}],
+                                                    output_format='list')[0]
+        print(named_run.info.run_name)
+        key = jax.random.PRNGKey(0)
+        key, q_key = jax.random.split(key, 2)
+        keys = jax.random.split(key,1)#.reshape(NUM_DEVICES, NUM_ENVS//NUM_DEVICES,-1)
+
+        state, info = env.reset()
+        state = state[None,...]#.reshape(-1,np.array(env.observation_space.shape).prod())
+
+        q_network = DQNAgentFlax(action_dim=env.action_space.n)
+        params = q_network.init(q_key, state)
+
+
+
+        with open(f'flaxmodels/dqn_doorsgym_{500000}_{named_run.info.run_name}_mlp','rb') as f:
+
+            model_params = (flax.serialization.from_bytes(params,f.read()))
+
+    state, info = env.reset()
+    rewards = 0
+    all_rewards = 0
+    for i in range(300):
+
+        #action = env.action_space.sample()
+
+        if TORCHMODEL:
+
+            with torch.no_grad():
+                action = model(torch.as_tensor(state,device='cuda:0').float()).argmax().cpu().numpy()
+        else:
+            q_values = q_network.apply(model_params, state[None,...])
+
+            actions = q_values.argmax(axis=-1)
+            action = jax.device_get(actions)[0]
+
+
+        state, reward, terminated, truncated, info = env.step(action=action)
+        rewards += reward
+
+        cv2.waitKey(10)
+
+        if terminated or ((i+1)%20 == 0):
+            print(f' final return: {rewards}')
+            all_rewards += rewards
+            rewards = 0
+            state, info = env.reset(seed=i) 
+
+    print(all_rewards)
+    env.close()
+
+
+def test_gymEnv_JAX():
+
+    num_envs = 1
+    key = jax.random.PRNGKey(0)
+    key, q_key = jax.random.split(key, 2)
+    keys = jax.random.split(key,num_envs)#.reshape(NUM_DEVICES, NUM_ENVS//NUM_DEVICES,-1)
+
+    env = DoorsEnvJax(nDoors=3,
+                gridSize=[15,15],
+                )
+    
+
+    env_state, infos = env.reset(keys)# to emulate patch
+    infos["num_steps"] = infos["num_steps"].at[:].set(15)
+    obs,keys = env_state
+
+    obs = obs.reshape(-1,np.array(env.observation_space.shape).prod())
+
+    TorchModel = False
+
+    if TorchModel:
+
+        mlflow.set_tracking_uri("http://localhost:5000")
+        mlflow.set_experiment(f"runs/DoorsGymDQN__dqn_hopt")
+        named_run = mlflow.search_runs(filter_string=f"run_name='gentle-loon-975'",output_format='list')[0]
+
+        ranked_models = mlflow.search_logged_models(#experiment_ids=[f"runs/DoorsGymDQN__dqn_hopt"], # use active experiment if not specified
+                                                    filter_string=f"source_run_id='{named_run.info.run_id}'",
+                                                    order_by=[{"field_name": "metrics.rolling_reward", "ascending": False}],
+                                                    output_format="list",
+                                                    )
+        # Get the best performing model
+        best_model = ranked_models[0]
+
+        model_uri = f"models:/{best_model.model_id}" # or from dashboard
+        model = mlflow.pytorch.load_model(model_uri).eval()
+
+    else:
+        mlflow.set_experiment(f"runs/DoorsGymDQN__dqn_hopt_flax")
+        named_run = mlflow.search_runs(filter_string=f"run_name='rumbling-donkey-443'",
+                                                    #order_by=["metrics.rolling_reward DESC"],
+                                                    #order_by=[{"field_name": "metrics.rolling_reward", "ascending": False}],
+                                                    output_format='list')[0]
+
+        key = jax.random.PRNGKey(0)
+        key, q_key = jax.random.split(key, 2)
+        keys = jax.random.split(key,1)#.reshape(NUM_DEVICES, NUM_ENVS//NUM_DEVICES,-1)
+
+        #state, info = env.reset()
+        state = obs[None,...]#.reshape(-1,np.array(env.observation_space.shape).prod())
+
+        q_network = DQNAgentFlax(action_dim=env.action_space.n)
+        params = q_network.init(q_key, state)
+
+
+
+        with open(f'flaxmodels/dqn_doorsgym_{500000}_{named_run.info.run_name}_mlp','rb') as f:
+
+            model_params = (flax.serialization.from_bytes(params,f.read()))
+
+    return_sum = 0
     for i in range(100):
 
-        action = env.action_space.sample()
-        state, reward, terminated, truncated, info = env.step(action=action)
+        key = jax.random.split(key)[0]
+        actions = jax.random.randint(key,(num_envs,),minval=0,maxval=5)
+
+        if TorchModel:
+            with torch.no_grad():
+                actions = model(torch.as_tensor(jax.device_get(obs),device='cuda:0').float()).argmax().cpu().numpy()[None,...]
+        else:
+            q_values = q_network.apply(model_params, obs[None,...])
+
+            actions = q_values.argmax(axis=-1)
+            actions = jax.device_get(actions)[0]
+
+
+
+        env_state, rewards, terminated, truncated, infos = env.step(actions, env_state ,infos)
+        next_obs,new_key = env_state
+        obs = next_obs.reshape(-1,np.array(env.observation_space.shape).prod())
+
+        # TRY NOT TO MODIFY: record rewards for plotting purposes
+        finished = np.logical_or(terminated,truncated)
+        return_sum += rewards
+
+        if finished.any():
+
+            print(f"global_step={i}, episodic_return={infos['episode']['r'][finished].mean()}")
+
+            infos["episode"]["r"] = infos["episode"]["r"].at[finished].set(0)
+            infos["episode"]["l"] = infos["episode"]["l"].at[finished].set(0)
+            return_sum = 0
+
+
+        img = env.render(next_obs)[0,...]
+
+        cv2.imshow('a',jax.device_get(img))
         cv2.waitKey(10)
+
+    print('f return ',return_sum)
+    return_sum = 0
+
+
+def test_gymEnv_runtime():
+
+    gym.register(id='DoorsGym-v0',
+         entry_point="doorsenvs:DoorsGym",
+         max_episode_steps=25,)
+
+    def make_env(seed=None, num_steps = 300):
+
+        base_env = gym.make('DoorsGym-v0',
+                    max_episode_steps=num_steps,
+                    gridSize=[15,15],
+                    render_frames=False)
+
+        env = Autoreset(base_env)
+        env = RecordEpisodeStatistics(env)
+        _ = env.reset(seed=seed)
+
+        return env
+
+    num_steps = 512
+    results = []
+    for num_envs in range(1,501,20):
+
+
+        vecEnvs = gym.vector.AsyncVectorEnv([lambda : make_env(num_steps=num_steps) for i in range(num_envs)])
+
+        print('start')
+        start = time.time()
+        obs,infos = vecEnvs.reset()
+
+        for i in range(num_steps):
+
+            actions = vecEnvs.action_space.sample()
+            next_obs, rewards, terminated, truncated, infos = vecEnvs.step(actions)
+        
+        duration = time.time()-start
+        print('count')
+        print(f'N_Envs: {num_envs}. Time needed: {duration} seconds.')
+        results.append(f'{num_envs}:{duration}')
+        vecEnvs.close()
+
+    with open('runtime_doors_async.txt','w') as f:
+        f.write('\n'.join(results))
+
     
-    env.close()
 
 
 def main():
@@ -395,7 +618,6 @@ def main():
     elif alg ==6:
         agent = torch.load(f'infogail_agent_iter_{80}_mlp.pth')
         qnet = torch.load(f'infogail_qnet_iter_{80}_mlp.pth')
-
 
     obs = env.reset(agent_at=0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -463,4 +685,6 @@ def main():
 
 if __name__=='__main__':
 
+    #test_gymEnv_runtime()
     test_gymEnv()
+    #test_gymEnv_JAX()
